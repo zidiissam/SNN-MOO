@@ -1,0 +1,1722 @@
+package org.moeaframework.algorithm;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.moeaframework.core.PRNG;
+import org.moeaframework.core.Settings;
+import org.moeaframework.core.Solution;
+import org.moeaframework.core.TypedProperties;
+import org.moeaframework.core.configuration.Configurable;
+import org.moeaframework.core.configuration.Property;
+import org.moeaframework.core.initialization.Initialization;
+import org.moeaframework.core.initialization.RandomInitialization;
+import org.moeaframework.core.population.NondominatedPopulation;
+import org.moeaframework.core.variable.RealVariable;
+import org.moeaframework.problem.Problem;
+import org.moeaframework.util.validate.Validate;
+
+/**
+ * SNN + NSGA-II/III + JADE/SHADE-like DE + OMOPSO turbulence hybrid.
+ *
+ * Main idea:
+ * - SNN is used as a fast structured generator
+ * - NSGA-II style elitist environmental selection drives convergence
+ * - NSGA-III style reference-vector niching is used for many-objective last-front filling
+ * - JADE/SHADE style current-to-pbest DE improves search power at low cost
+ * - OMOPSO-style turbulence helps escape stagnation
+ * - An external archive stores elite nondominated leaders, but it is not the only engine
+ *
+ * Notes:
+ * - competitive runtime comes from small offspring size, cached archive stats, and simple operators
+ * - for two objectives, crowding is used in the final split front
+ * - for three or more objectives, reference-vector PBI niching is used
+ */
+public class SNNHybridReferenceEnvSelectionT extends AbstractAlgorithm implements Configurable {
+
+    private static final int OP_SNN = 0;
+    private static final int OP_DE = 1;
+    private static final int OP_SBX = 2;
+    private static final int OP_TURB = 3;
+    private static final int NUM_OPERATORS = 4;
+
+    private final Initialization initialization;
+    private final NondominatedPopulation archive;
+
+    // Core sizes
+    private int populationSize;
+    private int offspringSize;
+    private int archiveSize;
+    private int neuronsPerVariable;
+    private int referenceVectorCount;
+    private int gridBins;
+
+    // SNN dynamics
+    private double learningRate;
+    private double punishment;
+    private double decay;
+    private double temperature;
+    private double minTemperature;
+    private double maxTemperature;
+    private double noiseAmplitude;
+    private double minNoiseAmplitude;
+    private double maxNoiseAmplitude;
+    private double localSearchSigma;
+    private double minLocalSearchSigma;
+    private double maxLocalSearchSigma;
+    private double leaderAttraction;
+    private double archivePullStrength;
+    private double dormantBoost;
+    private double lateralInhibition;
+
+    // Variation parameters
+    private double turbulenceStrength;
+    private double mutationRate;
+    private double polynomialEta;
+    private double sbxEta;
+    private double pbiTheta;
+    private double pbestRate;
+    private int stagnationThreshold;
+    private int shadeMemorySize;
+
+    // State
+    private List<Solution> population;
+    private double[][] membranePotentials;
+    private double[][] firingUsage;
+    private double[][] referenceVectors;
+    private boolean modelInitialized;
+    private int iterationCounter;
+    private int iterationsWithoutImprovement;
+
+    // SHADE-style memories for DE
+    private double[] memoryF;
+    private double[] memoryCR;
+    private int memoryIndex;
+
+    // Adaptive operator selection
+    private double[] operatorScore;
+    private int[] operatorUsage;
+    private int[] operatorSuccess;
+
+    // Cached archive stats
+    private boolean cacheDirty;
+    private List<Solution> cachedArchiveList;
+    private double[] cachedCrowding;
+    private GridData cachedGrid;
+    private double[] cachedObjMin;
+    private double[] cachedObjMax;
+    private int[] cachedNicheCounts;
+    private double[] cachedBestPBI;
+    private Solution[] cachedBestPerNiche;
+    private IdentityHashMap<Solution, ReferenceAssociation> cachedAssociations;
+
+    public SNNHybridReferenceEnvSelectionT(Problem problem) {
+        this(problem,
+                48,
+                24,
+                120,
+                17,
+                new RandomInitialization(problem),
+                new NondominatedPopulation());
+    }
+
+    public SNNHybridReferenceEnvSelectionT(
+            Problem problem,
+            int populationSize,
+            int offspringSize,
+            int archiveSize,
+            int neuronsPerVariable,
+            Initialization initialization,
+            NondominatedPopulation archive) {
+        super(problem);
+
+        Validate.that("initialization", initialization).isNotNull();
+        Validate.that("archive", archive).isNotNull();
+
+        this.initialization = initialization;
+        this.archive = archive;
+
+        setPopulationSize(populationSize);
+        setOffspringSize(offspringSize);
+        setArchiveSize(archiveSize);
+        setNeuronsPerVariable(neuronsPerVariable);
+
+        this.referenceVectorCount = Math.max(archiveSize, populationSize);
+        this.gridBins = 6;
+        this.stagnationThreshold = 8;
+        this.shadeMemorySize = 5;
+
+        this.learningRate = 0.20;
+        this.punishment = 0.10;
+        this.decay = 0.996;
+
+        this.temperature = 0.58;
+        this.minTemperature = 0.10;
+        this.maxTemperature = 1.15;
+
+        this.noiseAmplitude = 0.05;
+        this.minNoiseAmplitude = 0.005;
+        this.maxNoiseAmplitude = 0.20;
+
+        this.localSearchSigma = 0.028;
+        this.minLocalSearchSigma = 0.004;
+        this.maxLocalSearchSigma = 0.12;
+
+        this.leaderAttraction = 3.1;
+        this.archivePullStrength = 0.34;
+        this.dormantBoost = 0.18;
+        this.lateralInhibition = 0.08;
+
+        this.turbulenceStrength = 0.20;
+        this.mutationRate = 0.08;
+        this.polynomialEta = 20.0;
+        this.sbxEta = 18.0;
+        this.pbiTheta = 4.5;
+        this.pbestRate = 0.22;
+
+        this.population = new ArrayList<Solution>();
+        this.memoryF = new double[shadeMemorySize];
+        this.memoryCR = new double[shadeMemorySize];
+        Arrays.fill(this.memoryF, 0.55);
+        Arrays.fill(this.memoryCR, 0.88);
+        this.memoryIndex = 0;
+
+        this.operatorScore = new double[] {1.0, 1.0, 1.0, 1.0};
+        this.operatorUsage = new int[NUM_OPERATORS];
+        this.operatorSuccess = new int[NUM_OPERATORS];
+
+        this.cacheDirty = true;
+    }
+
+    @Override
+    public String getName() {
+        return "SNN-Hybrid-Reference-EnvSelection";
+    }
+
+    @Override
+    public void initialize() {
+        super.initialize();
+        initializeNeuronModel();
+        initializeReferenceModel();
+
+        Solution[] seeds = initialization.initialize(populationSize);
+        evaluateAll(seeds);
+
+        List<Solution> seedList = new ArrayList<Solution>(Arrays.asList(seeds));
+        population = environmentalSelection(seedList, populationSize);
+
+        archive.addAll(population);
+        trimArchive();
+        refreshArchiveStatsIfNeeded();
+
+        for (Solution s : population) {
+            reinforceTowards(s, 0.18);
+        }
+
+        iterationCounter = 0;
+        iterationsWithoutImprovement = 0;
+    }
+
+    @Override
+    protected void iterate() {
+        if (!modelInitialized) {
+            initializeNeuronModel();
+            initializeReferenceModel();
+        }
+
+        iterationCounter++;
+        decayMembranes();
+        refreshArchiveStatsIfNeeded();
+
+        RankingData currentRanking = buildRanking(population);
+        List<OffspringRecord> records = generateOffspring(currentRanking);
+
+        if (records.isEmpty()) {
+            return;
+        }
+
+        List<Solution> children = new ArrayList<Solution>(records.size());
+        for (OffspringRecord record : records) {
+            children.add(record.child);
+        }
+
+        evaluateAll(children);
+
+        List<Solution> union = new ArrayList<Solution>(population.size() + children.size());
+        union.addAll(population);
+        union.addAll(children);
+
+        List<Solution> nextPopulation = environmentalSelection(union, populationSize);
+        IdentityHashMap<Solution, Boolean> survivors = new IdentityHashMap<Solution, Boolean>();
+        for (Solution s : nextPopulation) {
+            survivors.put(s, Boolean.TRUE);
+        }
+
+        List<Double> successF = new ArrayList<Double>();
+        List<Double> successCR = new ArrayList<Double>();
+        List<Double> successWeight = new ArrayList<Double>();
+
+        int accepted = 0;
+
+        for (OffspringRecord record : records) {
+            boolean survived = survivors.containsKey(record.child);
+            double reward = survived ? computeReward(record.child, record.parentA, record.parentB) : -punishment;
+
+            learnFromOutcome(record, survived, reward);
+            operatorUsage[record.operator]++;
+
+            if (survived) {
+                accepted++;
+                operatorSuccess[record.operator]++;
+                operatorScore[record.operator] = 0.88 * operatorScore[record.operator] + 0.12 * (1.0 + Math.max(0.0, reward));
+
+                if (record.operator == OP_DE && record.fParameter > 0.0) {
+                    successF.add(record.fParameter);
+                    successCR.add(record.crParameter);
+                    successWeight.add(Math.max(1.0e-9, reward));
+                }
+            } else {
+                operatorScore[record.operator] = 0.96 * operatorScore[record.operator] + 0.04 * 0.35;
+            }
+        }
+
+        updateShadeMemory(successF, successCR, successWeight);
+
+        population = nextPopulation;
+        archive.addAll(population);
+        trimArchive();
+        refreshArchiveStatsIfNeeded();
+
+        if (accepted == 0) {
+            iterationsWithoutImprovement++;
+        } else {
+            iterationsWithoutImprovement = 0;
+        }
+
+        if (iterationsWithoutImprovement >= stagnationThreshold) {
+            injectRescueBatch(currentRanking);
+            iterationsWithoutImprovement = 0;
+        }
+
+        adaptControlParameters(accepted, children.size());
+    }
+
+    @Override
+    public NondominatedPopulation getResult() {
+        return archive;
+    }
+
+    // ---------------------------------------------------------------------
+    // Offspring generation
+    // ---------------------------------------------------------------------
+
+    private List<OffspringRecord> generateOffspring(RankingData ranking) {
+        List<OffspringRecord> records = new ArrayList<OffspringRecord>(offspringSize);
+
+        for (int i = 0; i < offspringSize; i++) {
+            int operator = chooseOperator();
+            OffspringRecord record;
+
+            if (operator == OP_DE) {
+                record = makeDEOffspring(ranking);
+            } else if (operator == OP_SBX) {
+                record = makeSBXOffspring(ranking);
+            } else if (operator == OP_TURB) {
+                record = makeTurbulenceOffspring(ranking);
+            } else {
+                record = makeSNNOffspring();
+            }
+
+            records.add(record);
+        }
+
+        return records;
+    }
+
+    private OffspringRecord makeSNNOffspring() {
+        Solution leader = selectLeaderEnhanced();
+        int[] firedBins = new int[getNumberOfDecisionVariables()];
+        Solution child = sampleFromNetworkEnhanced(leader, firedBins);
+
+        OffspringRecord record = new OffspringRecord();
+        record.child = child;
+        record.parentA = leader;
+        record.parentB = null;
+        record.operator = OP_SNN;
+        record.firedBins = firedBins;
+        record.fParameter = -1.0;
+        record.crParameter = -1.0;
+        return record;
+    }
+
+    private OffspringRecord makeDEOffspring(RankingData ranking) {
+        Solution current = tournamentSelect(ranking);
+        Solution pbest = selectPBest();
+        Solution r1 = selectFromPopulationOrArchiveDistinct(current, null);
+        Solution r2 = selectFromPopulationOrArchiveDistinct(current, r1);
+
+        int memorySlot = PRNG.nextInt(shadeMemorySize);
+        double f = sampleF(memoryF[memorySlot]);
+        double cr = sampleCR(memoryCR[memorySlot]);
+
+        Solution child = currentToPBest1Bin(current, pbest, r1, r2, f, cr);
+
+        OffspringRecord record = new OffspringRecord();
+        record.child = child;
+        record.parentA = current;
+        record.parentB = pbest;
+        record.operator = OP_DE;
+        record.firedBins = extractBins(child);
+        record.fParameter = f;
+        record.crParameter = cr;
+        return record;
+    }
+
+    private OffspringRecord makeSBXOffspring(RankingData ranking) {
+        Solution p1 = tournamentSelect(ranking);
+        Solution p2 = tournamentSelectDistinct(ranking, p1);
+        Solution child = sbxAndPolynomialMutation(p1, p2);
+
+        OffspringRecord record = new OffspringRecord();
+        record.child = child;
+        record.parentA = p1;
+        record.parentB = p2;
+        record.operator = OP_SBX;
+        record.firedBins = extractBins(child);
+        record.fParameter = -1.0;
+        record.crParameter = -1.0;
+        return record;
+    }
+
+    private OffspringRecord makeTurbulenceOffspring(RankingData ranking) {
+        Solution base = tournamentSelect(ranking);
+        Solution leader = selectLeaderEnhanced();
+        Solution pbest = selectPBest();
+        Solution child = omopsoTurbulence(base, leader, pbest);
+
+        OffspringRecord record = new OffspringRecord();
+        record.child = child;
+        record.parentA = base;
+        record.parentB = leader;
+        record.operator = OP_TURB;
+        record.firedBins = extractBins(child);
+        record.fParameter = -1.0;
+        record.crParameter = -1.0;
+        return record;
+    }
+
+    private int chooseOperator() {
+        double total = 0.0;
+        for (int i = 0; i < NUM_OPERATORS; i++) {
+            total += Math.max(0.08, operatorScore[i]);
+        }
+
+        double draw = PRNG.nextDouble() * total;
+        double cumulative = 0.0;
+
+        for (int i = 0; i < NUM_OPERATORS; i++) {
+            cumulative += Math.max(0.08, operatorScore[i]);
+            if (cumulative >= draw) {
+                return i;
+            }
+        }
+
+        return OP_SNN;
+    }
+
+    // ---------------------------------------------------------------------
+    // Environmental selection
+    // ---------------------------------------------------------------------
+
+    private List<Solution> environmentalSelection(List<Solution> union, int targetSize) {
+        List<List<Solution>> fronts = fastNonDominatedSort(union);
+        List<Solution> next = new ArrayList<Solution>(targetSize);
+
+        int index = 0;
+        while (index < fronts.size() && next.size() + fronts.get(index).size() <= targetSize) {
+            next.addAll(fronts.get(index));
+            index++;
+        }
+
+        if (next.size() == targetSize || index >= fronts.size()) {
+            return next;
+        }
+
+        List<Solution> lastFront = new ArrayList<Solution>(fronts.get(index));
+        int remaining = targetSize - next.size();
+
+        if (problem.newSolution().getNumberOfObjectives() <= 2) {
+            double[] crowding = crowdingDistance(lastFront);
+            Integer[] order = new Integer[lastFront.size()];
+            for (int i = 0; i < order.length; i++) {
+                order[i] = i;
+            }
+            Arrays.sort(order, new Comparator<Integer>() {
+                @Override
+                public int compare(Integer a, Integer b) {
+                    return Double.compare(crowding[b.intValue()], crowding[a.intValue()]);
+                }
+            });
+            for (int i = 0; i < remaining && i < order.length; i++) {
+                next.add(lastFront.get(order[i].intValue()));
+            }
+        } else {
+            next.addAll(selectByReferenceNiching(lastFront, remaining, next));
+        }
+
+        return next;
+    }
+
+    private List<Solution> selectByReferenceNiching(List<Solution> lastFront, int remaining, List<Solution> alreadySelected) {
+        List<Solution> chosen = new ArrayList<Solution>(remaining);
+        if (lastFront.isEmpty() || remaining <= 0) {
+            return chosen;
+        }
+
+        List<Solution> all = new ArrayList<Solution>(alreadySelected.size() + lastFront.size());
+        all.addAll(alreadySelected);
+        all.addAll(lastFront);
+
+        double[] min = objectiveMin(all);
+        double[] max = objectiveMax(all);
+
+        int[] occupancy = new int[referenceVectors.length];
+        for (Solution s : alreadySelected) {
+            ReferenceAssociation assoc = computeReferenceAssociation(s, min, max);
+            occupancy[assoc.vectorIndex]++;
+        }
+
+        List<Solution> pool = new ArrayList<Solution>(lastFront);
+        while (chosen.size() < remaining && !pool.isEmpty()) {
+            Solution best = null;
+            double bestScore = Double.POSITIVE_INFINITY;
+
+            for (Solution s : pool) {
+                ReferenceAssociation assoc = computeReferenceAssociation(s, min, max);
+                double score = occupancy[assoc.vectorIndex] + assoc.pbi;
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = s;
+                }
+            }
+
+            if (best == null) {
+                break;
+            }
+
+            chosen.add(best);
+            ReferenceAssociation assoc = computeReferenceAssociation(best, min, max);
+            occupancy[assoc.vectorIndex]++;
+            pool.remove(best);
+        }
+
+        return chosen;
+    }
+
+    private RankingData buildRanking(List<Solution> solutions) {
+        RankingData data = new RankingData();
+        data.rank = new IdentityHashMap<Solution, Integer>();
+        data.crowding = new IdentityHashMap<Solution, Double>();
+        data.fronts = fastNonDominatedSort(solutions);
+
+        for (int i = 0; i < data.fronts.size(); i++) {
+            List<Solution> front = data.fronts.get(i);
+            double[] cd = crowdingDistance(front);
+            for (int j = 0; j < front.size(); j++) {
+                data.rank.put(front.get(j), Integer.valueOf(i));
+                data.crowding.put(front.get(j), Double.valueOf(cd[j]));
+            }
+        }
+
+        return data;
+    }
+
+    private List<List<Solution>> fastNonDominatedSort(List<Solution> solutions) {
+        List<List<Solution>> fronts = new ArrayList<List<Solution>>();
+        IdentityHashMap<Solution, List<Solution>> dominatesSet = new IdentityHashMap<Solution, List<Solution>>();
+        IdentityHashMap<Solution, Integer> dominatedCount = new IdentityHashMap<Solution, Integer>();
+
+        List<Solution> firstFront = new ArrayList<Solution>();
+
+        for (Solution p : solutions) {
+            List<Solution> dominated = new ArrayList<Solution>();
+            int count = 0;
+
+            for (Solution q : solutions) {
+                if (p == q) {
+                    continue;
+                }
+                if (dominates(p, q)) {
+                    dominated.add(q);
+                } else if (dominates(q, p)) {
+                    count++;
+                }
+            }
+
+            dominatesSet.put(p, dominated);
+            dominatedCount.put(p, Integer.valueOf(count));
+
+            if (count == 0) {
+                firstFront.add(p);
+            }
+        }
+
+        fronts.add(firstFront);
+
+        int i = 0;
+        while (i < fronts.size() && !fronts.get(i).isEmpty()) {
+            List<Solution> nextFront = new ArrayList<Solution>();
+
+            for (Solution p : fronts.get(i)) {
+                for (Solution q : dominatesSet.get(p)) {
+                    int count = dominatedCount.get(q).intValue() - 1;
+                    dominatedCount.put(q, Integer.valueOf(count));
+                    if (count == 0) {
+                        nextFront.add(q);
+                    }
+                }
+            }
+
+            if (!nextFront.isEmpty()) {
+                fronts.add(nextFront);
+            }
+            i++;
+        }
+
+        return fronts;
+    }
+
+    // ---------------------------------------------------------------------
+    // Operators
+    // ---------------------------------------------------------------------
+
+    private Solution currentToPBest1Bin(Solution current, Solution pbest, Solution r1, Solution r2, double f, double cr) {
+        Solution child = current.copy();
+        int jrand = PRNG.nextInt(child.getNumberOfVariables());
+
+        for (int var = 0; var < child.getNumberOfVariables(); var++) {
+            if (!(child.getVariable(var) instanceof RealVariable)
+                    || !(pbest.getVariable(var) instanceof RealVariable)
+                    || !(r1.getVariable(var) instanceof RealVariable)
+                    || !(r2.getVariable(var) instanceof RealVariable)) {
+                continue;
+            }
+
+            RealVariable xv = (RealVariable) child.getVariable(var);
+            double x = xv.getValue();
+            double p = ((RealVariable) pbest.getVariable(var)).getValue();
+            double a = ((RealVariable) r1.getVariable(var)).getValue();
+            double b = ((RealVariable) r2.getVariable(var)).getValue();
+            double lower = xv.getLowerBound();
+            double upper = xv.getUpperBound();
+
+            if (PRNG.nextDouble() < cr || var == jrand) {
+                double v = x + f * (p - x) + f * (a - b);
+                v += 0.08 * (upper - lower) * localSearchSigma * PRNG.nextGaussian();
+                xv.setValue(clamp(v, lower, upper));
+            }
+        }
+
+        return child;
+    }
+
+    private Solution sbxAndPolynomialMutation(Solution p1, Solution p2) {
+        Solution child = p1.copy();
+
+        for (int var = 0; var < child.getNumberOfVariables(); var++) {
+            if (!(child.getVariable(var) instanceof RealVariable)
+                    || !(p2.getVariable(var) instanceof RealVariable)) {
+                continue;
+            }
+
+            RealVariable c = (RealVariable) child.getVariable(var);
+            RealVariable m = (RealVariable) p2.getVariable(var);
+
+            double y1 = c.getValue();
+            double y2 = m.getValue();
+            double lower = c.getLowerBound();
+            double upper = c.getUpperBound();
+
+            if (PRNG.nextDouble() < 0.92) {
+                double u = PRNG.nextDouble();
+                double beta;
+                if (u <= 0.5) {
+                    beta = Math.pow(2.0 * u, 1.0 / (sbxEta + 1.0));
+                } else {
+                    beta = Math.pow(1.0 / (2.0 * (1.0 - u)), 1.0 / (sbxEta + 1.0));
+                }
+                double childValue = 0.5 * ((1.0 + beta) * y1 + (1.0 - beta) * y2);
+                c.setValue(clamp(childValue, lower, upper));
+            }
+
+            if (PRNG.nextDouble() < mutationRate || PRNG.nextDouble() < 1.0 / Math.max(1, child.getNumberOfVariables())) {
+                double y = c.getValue();
+                double delta1 = (y - lower) / Math.max(1.0e-12, upper - lower);
+                double delta2 = (upper - y) / Math.max(1.0e-12, upper - lower);
+                double rnd = PRNG.nextDouble();
+                double mutPow = 1.0 / (polynomialEta + 1.0);
+                double deltaq;
+
+                if (rnd < 0.5) {
+                    double xy = 1.0 - delta1;
+                    double val = 2.0 * rnd + (1.0 - 2.0 * rnd) * Math.pow(xy, polynomialEta + 1.0);
+                    deltaq = Math.pow(val, mutPow) - 1.0;
+                } else {
+                    double xy = 1.0 - delta2;
+                    double val = 2.0 * (1.0 - rnd) + 2.0 * (rnd - 0.5) * Math.pow(xy, polynomialEta + 1.0);
+                    deltaq = 1.0 - Math.pow(val, mutPow);
+                }
+
+                y += deltaq * (upper - lower);
+                c.setValue(clamp(y, lower, upper));
+            }
+        }
+
+        return child;
+    }
+
+    private Solution omopsoTurbulence(Solution base, Solution leader, Solution pbest) {
+        Solution child = base.copy();
+
+        for (int var = 0; var < child.getNumberOfVariables(); var++) {
+            if (!(child.getVariable(var) instanceof RealVariable)) {
+                continue;
+            }
+
+            RealVariable cv = (RealVariable) child.getVariable(var);
+            double x = cv.getValue();
+            double lower = cv.getLowerBound();
+            double upper = cv.getUpperBound();
+            double g = (leader != null && leader.getVariable(var) instanceof RealVariable)
+                    ? ((RealVariable) leader.getVariable(var)).getValue() : x;
+            double p = (pbest != null && pbest.getVariable(var) instanceof RealVariable)
+                    ? ((RealVariable) pbest.getVariable(var)).getValue() : x;
+
+            double value = x
+                    + turbulenceStrength * PRNG.nextDouble() * (p - x)
+                    + turbulenceStrength * PRNG.nextDouble() * (g - x)
+                    + localSearchSigma * (upper - lower) * PRNG.nextGaussian();
+
+            if (PRNG.nextDouble() < 0.10) {
+                value = lower + upper - value;
+            }
+
+            cv.setValue(clamp(value, lower, upper));
+        }
+
+        return child;
+    }
+
+    // ---------------------------------------------------------------------
+    // SNN sampling and learning
+    // ---------------------------------------------------------------------
+
+    private Solution sampleFromNetworkEnhanced(Solution leader, int[] firedBins) {
+        Solution base = (leader == null) ? initialization.initialize(1)[0] : leader.copy();
+
+        for (int var = 0; var < base.getNumberOfVariables(); var++) {
+            if (!(base.getVariable(var) instanceof RealVariable)) {
+                firedBins[var] = -1;
+                continue;
+            }
+
+            RealVariable variable = (RealVariable) base.getVariable(var);
+            double lower = variable.getLowerBound();
+            double upper = variable.getUpperBound();
+
+            double leaderValue = Double.NaN;
+            if (leader != null && leader.getVariable(var) instanceof RealVariable) {
+                leaderValue = ((RealVariable) leader.getVariable(var)).getValue();
+            }
+
+            int leaderBin = Double.isNaN(leaderValue) ? -1 : valueToBin(leaderValue, lower, upper);
+            int winner = sampleWinningNeuron(var, leaderBin);
+            firedBins[var] = winner;
+            firingUsage[var][winner] += 1.0;
+
+            double center = binToValue(winner, lower, upper);
+            double value = center + localSearchSigma * (upper - lower) * PRNG.nextGaussian();
+
+            if (!Double.isNaN(leaderValue)) {
+                value = (1.0 - archivePullStrength) * value + archivePullStrength * leaderValue;
+            }
+
+            variable.setValue(clamp(value, lower, upper));
+        }
+
+        return base;
+    }
+
+    private int sampleWinningNeuron(int variableIndex, int leaderBin) {
+        double[] logits = new double[neuronsPerVariable];
+        double max = -Double.MAX_VALUE;
+        int leastUsed = leastUsedNeuron(variableIndex);
+
+        for (int b = 0; b < neuronsPerVariable; b++) {
+            double current = membranePotentials[variableIndex][b];
+            double guide = (leaderBin >= 0) ? leaderAttraction * gaussianKernel(b - leaderBin, 1.8) : 0.0;
+            double noveltyBias = (b == leastUsed) ? dormantBoost * 0.35 : 0.0;
+            double noise = noiseAmplitude * PRNG.nextGaussian();
+            double logit = (current + guide + noveltyBias + noise) / Math.max(1.0e-6, temperature);
+            logits[b] = logit;
+            max = Math.max(max, logit);
+        }
+
+        double total = 0.0;
+        for (int b = 0; b < neuronsPerVariable; b++) {
+            logits[b] = Math.exp(logits[b] - max);
+            total += logits[b];
+        }
+
+        double draw = PRNG.nextDouble() * total;
+        double cumulative = 0.0;
+        for (int b = 0; b < neuronsPerVariable; b++) {
+            cumulative += logits[b];
+            if (cumulative >= draw) {
+                return b;
+            }
+        }
+
+        return neuronsPerVariable - 1;
+    }
+
+    private void learnFromOutcome(OffspringRecord record, boolean survived, double reward) {
+        if (survived) {
+            reinforceTowards(record.child, 0.12 + 0.10 * Math.max(0.0, reward));
+            reinforceReferenceDirection(record.child, associateToReferenceVector(record.child));
+            archiveConsensusPlasticity(record.child, reward);
+        }
+
+        updateMembranesEnhanced(record.parentA, record.firedBins, reward);
+    }
+
+    private void updateMembranesEnhanced(Solution guide, int[] firedBins, double reward) {
+        for (int var = 0; var < firedBins.length; var++) {
+            int fired = firedBins[var];
+            if (fired < 0) {
+                continue;
+            }
+
+            int guideBin = -1;
+            if (guide != null && guide.getVariable(var) instanceof RealVariable) {
+                RealVariable gv = (RealVariable) guide.getVariable(var);
+                guideBin = valueToBin(gv.getValue(), gv.getLowerBound(), gv.getUpperBound());
+            }
+
+            for (int b = 0; b < neuronsPerVariable; b++) {
+                double excitation = gaussianKernel(b - fired, 1.2);
+                membranePotentials[var][b] += learningRate * reward * excitation;
+
+                if (reward > 0.0 && b != fired) {
+                    membranePotentials[var][b] -= learningRate * lateralInhibition * reward * gaussianKernel(b - fired, 2.6);
+                }
+
+                if (guideBin >= 0) {
+                    membranePotentials[var][b] += 0.25 * learningRate * reward * gaussianKernel(b - guideBin, 1.8);
+                }
+
+                membranePotentials[var][b] = clamp(membranePotentials[var][b], -8.0, 8.0);
+            }
+        }
+    }
+
+    private void archiveConsensusPlasticity(Solution candidate, double reward) {
+        if (reward <= 0.0 || archive.isEmpty()) {
+            return;
+        }
+
+        int count = Math.min(3, archive.size());
+        for (int k = 0; k < count; k++) {
+            Solution leader = selectLeaderEnhanced();
+            if (leader == null) {
+                continue;
+            }
+
+            for (int var = 0; var < candidate.getNumberOfVariables(); var++) {
+                if (!(candidate.getVariable(var) instanceof RealVariable)
+                        || !(leader.getVariable(var) instanceof RealVariable)) {
+                    continue;
+                }
+
+                RealVariable cv = (RealVariable) candidate.getVariable(var);
+                RealVariable lv = (RealVariable) leader.getVariable(var);
+                int bin = valueToBin(lv.getValue(), cv.getLowerBound(), cv.getUpperBound());
+
+                for (int b = 0; b < neuronsPerVariable; b++) {
+                    membranePotentials[var][b] += 0.08 * reward * gaussianKernel(b - bin, 2.0);
+                    membranePotentials[var][b] = clamp(membranePotentials[var][b], -8.0, 8.0);
+                }
+            }
+        }
+    }
+
+    private void reinforceReferenceDirection(Solution candidate, ReferenceAssociation assoc) {
+        for (int var = 0; var < candidate.getNumberOfVariables(); var++) {
+            if (!(candidate.getVariable(var) instanceof RealVariable)) {
+                continue;
+            }
+
+            RealVariable variable = (RealVariable) candidate.getVariable(var);
+            int bin = valueToBin(variable.getValue(), variable.getLowerBound(), variable.getUpperBound());
+            double scale = 0.06 + 0.14 / (1.0 + assoc.pbi);
+
+            for (int b = 0; b < neuronsPerVariable; b++) {
+                membranePotentials[var][b] += scale * gaussianKernel(b - bin, 1.4);
+                membranePotentials[var][b] = clamp(membranePotentials[var][b], -8.0, 8.0);
+            }
+        }
+    }
+
+    private void reinforceTowards(Solution solution, double scale) {
+        for (int var = 0; var < solution.getNumberOfVariables(); var++) {
+            if (!(solution.getVariable(var) instanceof RealVariable)) {
+                continue;
+            }
+
+            RealVariable rv = (RealVariable) solution.getVariable(var);
+            int bin = valueToBin(rv.getValue(), rv.getLowerBound(), rv.getUpperBound());
+
+            for (int b = 0; b < neuronsPerVariable; b++) {
+                membranePotentials[var][b] += scale * gaussianKernel(b - bin, 1.5);
+                membranePotentials[var][b] = clamp(membranePotentials[var][b], -8.0, 8.0);
+            }
+        }
+    }
+
+    private void decayMembranes() {
+        for (int i = 0; i < membranePotentials.length; i++) {
+            for (int j = 0; j < membranePotentials[i].length; j++) {
+                membranePotentials[i][j] *= decay;
+                firingUsage[i][j] *= 0.999;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Archive-guided leader selection and rewards
+    // ---------------------------------------------------------------------
+
+    private Solution selectLeaderEnhanced() {
+        refreshArchiveStatsIfNeeded();
+
+        if (cachedArchiveList.isEmpty()) {
+            return population.isEmpty() ? null : population.get(PRNG.nextInt(population.size()));
+        }
+
+        double r = PRNG.nextDouble();
+        if (r < 0.44) {
+            return selectLeaderByReferenceNiching();
+        } else if (r < 0.70) {
+            return selectLeaderByCrowdingRoulette();
+        } else if (r < 0.90) {
+            return selectLeaderBySparseGridRoulette();
+        } else {
+            return cachedArchiveList.get(PRNG.nextInt(cachedArchiveList.size()));
+        }
+    }
+
+    private Solution selectLeaderByReferenceNiching() {
+        int bestIndex = -1;
+        double bestScore = Double.POSITIVE_INFINITY;
+
+        for (int i = 0; i < referenceVectors.length; i++) {
+            if (cachedBestPerNiche[i] == null) {
+                continue;
+            }
+            double score = cachedNicheCounts[i] + cachedBestPBI[i];
+            if (score < bestScore) {
+                bestScore = score;
+                bestIndex = i;
+            }
+        }
+
+        if (bestIndex >= 0 && cachedBestPerNiche[bestIndex] != null) {
+            return cachedBestPerNiche[bestIndex];
+        }
+
+        return cachedArchiveList.get(PRNG.nextInt(cachedArchiveList.size()));
+    }
+
+    private Solution selectLeaderByCrowdingRoulette() {
+        double maxFinite = 1.0;
+        for (double value : cachedCrowding) {
+            if (!Double.isInfinite(value) && !Double.isNaN(value)) {
+                maxFinite = Math.max(maxFinite, value);
+            }
+        }
+
+        double[] weights = new double[cachedArchiveList.size()];
+        double total = 0.0;
+        for (int i = 0; i < cachedArchiveList.size(); i++) {
+            double cd = cachedCrowding[i];
+            double w = Double.isInfinite(cd) ? (maxFinite + 1.0) : Math.max(1.0e-12, cd + 1.0e-12);
+            weights[i] = w;
+            total += w;
+        }
+
+        return roulette(cachedArchiveList, weights, total);
+    }
+
+    private Solution selectLeaderBySparseGridRoulette() {
+        double[] weights = new double[cachedArchiveList.size()];
+        double total = 0.0;
+
+        for (int i = 0; i < cachedArchiveList.size(); i++) {
+            int count = cachedGrid.occupancy.get(cachedGrid.keys[i]).intValue();
+            weights[i] = 1.0 / Math.max(1, count);
+            total += weights[i];
+        }
+
+        return roulette(cachedArchiveList, weights, total);
+    }
+
+    private double computeReward(Solution child, Solution parentA, Solution parentB) {
+        refreshArchiveStatsIfNeeded();
+
+        double novelty = objectiveNovelty(child);
+        ReferenceAssociation assoc = associateToReferenceVector(child);
+        double pbiBonus = pbiImprovementReward(assoc.vectorIndex, assoc.pbi);
+        double dominanceBonus = 0.0;
+
+        if (parentA != null) {
+            if (dominates(child, parentA)) {
+                dominanceBonus += 0.55;
+            } else if (!dominates(parentA, child)) {
+                dominanceBonus += 0.15;
+            }
+        }
+        if (parentB != null) {
+            if (dominates(child, parentB)) {
+                dominanceBonus += 0.45;
+            } else if (!dominates(parentB, child)) {
+                dominanceBonus += 0.10;
+            }
+        }
+
+        return 0.35 + 0.25 * novelty + 0.25 * pbiBonus + dominanceBonus;
+    }
+
+    private double objectiveNovelty(Solution candidate) {
+        if (cachedArchiveList.isEmpty()) {
+            return 1.0;
+        }
+
+        int m = candidate.getNumberOfObjectives();
+        double bestDistance = Double.POSITIVE_INFINITY;
+
+        for (Solution s : cachedArchiveList) {
+            double sum = 0.0;
+            for (int j = 0; j < m; j++) {
+                double denom = Math.max(1.0e-12, cachedObjMax[j] - cachedObjMin[j]);
+                double d = (objectiveValue(candidate, j) - objectiveValue(s, j)) / denom;
+                sum += d * d;
+            }
+            bestDistance = Math.min(bestDistance, Math.sqrt(sum));
+        }
+
+        return Math.min(1.0, bestDistance);
+    }
+
+    private double pbiImprovementReward(int vectorIndex, double candidatePBI) {
+        if (vectorIndex < 0 || vectorIndex >= cachedBestPBI.length) {
+            return 0.0;
+        }
+
+        double bestBefore = cachedBestPBI[vectorIndex];
+        if (Double.isInfinite(bestBefore)) {
+            return 1.0;
+        }
+
+        return Math.tanh(3.0 * (bestBefore - candidatePBI));
+    }
+
+    // ---------------------------------------------------------------------
+    // Rescue phase
+    // ---------------------------------------------------------------------
+
+    private void injectRescueBatch(RankingData ranking) {
+        int rescueSize = Math.max(6, offspringSize / 3);
+        List<Solution> rescue = new ArrayList<Solution>(rescueSize);
+
+        for (int i = 0; i < rescueSize; i++) {
+            Solution elite = tournamentSelect(ranking);
+            Solution leader = selectLeaderEnhanced();
+            Solution pbest = selectPBest();
+            Solution child;
+
+            double mode = PRNG.nextDouble();
+            if (mode < 0.45) {
+                child = omopsoTurbulence(elite, leader, pbest);
+            } else if (mode < 0.80) {
+                double f = sampleF(memoryF[PRNG.nextInt(shadeMemorySize)]);
+                double cr = sampleCR(memoryCR[PRNG.nextInt(shadeMemorySize)]);
+                Solution r1 = selectFromPopulationOrArchiveDistinct(elite, null);
+                Solution r2 = selectFromPopulationOrArchiveDistinct(elite, r1);
+                child = currentToPBest1Bin(elite, pbest, r1, r2, f, cr);
+            } else {
+                Solution opposite = elite.copy();
+                for (int var = 0; var < opposite.getNumberOfVariables(); var++) {
+                    if (!(opposite.getVariable(var) instanceof RealVariable)) {
+                        continue;
+                    }
+                    RealVariable v = (RealVariable) opposite.getVariable(var);
+                    double value = v.getValue();
+                    double opp = v.getLowerBound() + v.getUpperBound() - value;
+                    opp += 0.10 * (v.getUpperBound() - v.getLowerBound()) * PRNG.nextGaussian();
+                    v.setValue(clamp(opp, v.getLowerBound(), v.getUpperBound()));
+                }
+                child = opposite;
+            }
+
+            rescue.add(child);
+        }
+
+        evaluateAll(rescue);
+
+        List<Solution> union = new ArrayList<Solution>(population.size() + rescue.size());
+        union.addAll(population);
+        union.addAll(rescue);
+        population = environmentalSelection(union, populationSize);
+        archive.addAll(population);
+        trimArchive();
+        refreshArchiveStatsIfNeeded();
+    }
+
+    // ---------------------------------------------------------------------
+    // Archive caching and trimming
+    // ---------------------------------------------------------------------
+
+    private void refreshArchiveStatsIfNeeded() {
+        if (!cacheDirty) {
+            return;
+        }
+
+        cachedArchiveList = toList(archive);
+        cachedAssociations = new IdentityHashMap<Solution, ReferenceAssociation>();
+
+        if (cachedArchiveList.isEmpty()) {
+            cachedCrowding = new double[0];
+            cachedGrid = new GridData();
+            cachedGrid.keys = new String[0];
+            cachedGrid.occupancy = new HashMap<String, Integer>();
+            cachedObjMin = new double[0];
+            cachedObjMax = new double[0];
+            cachedNicheCounts = new int[referenceVectors.length];
+            cachedBestPBI = new double[referenceVectors.length];
+            Arrays.fill(cachedBestPBI, Double.POSITIVE_INFINITY);
+            cachedBestPerNiche = new Solution[referenceVectors.length];
+            cacheDirty = false;
+            return;
+        }
+
+        cachedObjMin = objectiveMin(cachedArchiveList);
+        cachedObjMax = objectiveMax(cachedArchiveList);
+        cachedCrowding = crowdingDistance(cachedArchiveList);
+        cachedGrid = buildGridData(cachedArchiveList);
+        cachedNicheCounts = new int[referenceVectors.length];
+        cachedBestPBI = new double[referenceVectors.length];
+        cachedBestPerNiche = new Solution[referenceVectors.length];
+        Arrays.fill(cachedBestPBI, Double.POSITIVE_INFINITY);
+
+        for (Solution s : cachedArchiveList) {
+            ReferenceAssociation assoc = computeReferenceAssociation(s, cachedObjMin, cachedObjMax);
+            cachedAssociations.put(s, assoc);
+            cachedNicheCounts[assoc.vectorIndex]++;
+            if (assoc.pbi < cachedBestPBI[assoc.vectorIndex]) {
+                cachedBestPBI[assoc.vectorIndex] = assoc.pbi;
+                cachedBestPerNiche[assoc.vectorIndex] = s;
+            }
+        }
+
+        cacheDirty = false;
+    }
+
+    private void trimArchive() {
+        if (archive.size() <= archiveSize) {
+            cacheDirty = true;
+            return;
+        }
+
+        List<Solution> list = toList(archive);
+        List<Solution> survivors = environmentalSelection(list, archiveSize);
+        archive.clear();
+        archive.addAll(survivors);
+        cacheDirty = true;
+    }
+
+    private ReferenceAssociation associateToReferenceVector(Solution s) {
+        ReferenceAssociation cached = cachedAssociations.get(s);
+        if (cached != null) {
+            return cached;
+        }
+        return computeReferenceAssociation(s, cachedObjMin, cachedObjMax);
+    }
+
+    private ReferenceAssociation computeReferenceAssociation(Solution s, double[] min, double[] max) {
+        ReferenceAssociation best = new ReferenceAssociation();
+        best.vectorIndex = -1;
+        best.pbi = Double.POSITIVE_INFINITY;
+
+        int m = s.getNumberOfObjectives();
+        double[] f = new double[m];
+
+        for (int j = 0; j < m; j++) {
+            double denom = Math.max(1.0e-12, max[j] - min[j]);
+            f[j] = (objectiveValue(s, j) - min[j]) / denom;
+        }
+
+        for (int k = 0; k < referenceVectors.length; k++) {
+            double[] w = referenceVectors[k];
+            double normW = 0.0;
+            double dot = 0.0;
+
+            for (int j = 0; j < m; j++) {
+                dot += f[j] * w[j];
+                normW += w[j] * w[j];
+            }
+
+            normW = Math.sqrt(Math.max(1.0e-12, normW));
+            double d1 = dot / normW;
+
+            double perp = 0.0;
+            for (int j = 0; j < m; j++) {
+                double proj = d1 * (w[j] / normW);
+                double diff = f[j] - proj;
+                perp += diff * diff;
+            }
+
+            double d2 = Math.sqrt(Math.max(0.0, perp));
+            double pbi = d1 + pbiTheta * d2;
+
+            if (pbi < best.pbi) {
+                best.vectorIndex = k;
+                best.d1 = d1;
+                best.d2 = d2;
+                best.pbi = pbi;
+            }
+        }
+
+        return best;
+    }
+
+    // ---------------------------------------------------------------------
+    // Initialization helpers
+    // ---------------------------------------------------------------------
+
+    private void initializeNeuronModel() {
+        int nvars = getNumberOfDecisionVariables();
+        membranePotentials = new double[nvars][neuronsPerVariable];
+        firingUsage = new double[nvars][neuronsPerVariable];
+        modelInitialized = true;
+    }
+
+    private void initializeReferenceModel() {
+        int objectives = problem.newSolution().getNumberOfObjectives();
+        referenceVectors = generateReferenceVectors(referenceVectorCount, objectives);
+    }
+
+    private double[][] generateReferenceVectors(int count, int objectives) {
+        double[][] vectors = new double[count][objectives];
+        int filled = 0;
+
+        for (int j = 0; j < objectives && filled < count; j++) {
+            Arrays.fill(vectors[filled], 0.0);
+            vectors[filled][j] = 1.0;
+            filled++;
+        }
+
+        while (filled < count) {
+            double sum = 0.0;
+            for (int j = 0; j < objectives; j++) {
+                double u = Math.max(1.0e-12, PRNG.nextDouble());
+                vectors[filled][j] = -Math.log(u);
+                sum += vectors[filled][j];
+            }
+            for (int j = 0; j < objectives; j++) {
+                vectors[filled][j] /= sum;
+            }
+            filled++;
+        }
+
+        return vectors;
+    }
+
+    // ---------------------------------------------------------------------
+    // Parent selection
+    // ---------------------------------------------------------------------
+
+    private Solution tournamentSelect(RankingData ranking) {
+        Solution a = population.get(PRNG.nextInt(population.size()));
+        Solution b = population.get(PRNG.nextInt(population.size()));
+
+        int rankA = ranking.rank.get(a).intValue();
+        int rankB = ranking.rank.get(b).intValue();
+
+        if (rankA < rankB) {
+            return a;
+        } else if (rankB < rankA) {
+            return b;
+        }
+
+        double crowdingA = ranking.crowding.get(a).doubleValue();
+        double crowdingB = ranking.crowding.get(b).doubleValue();
+
+        if (crowdingA > crowdingB) {
+            return a;
+        } else if (crowdingB > crowdingA) {
+            return b;
+        }
+
+        return scalarScore(a) <= scalarScore(b) ? a : b;
+    }
+
+    private Solution tournamentSelectDistinct(RankingData ranking, Solution other) {
+        Solution selected = tournamentSelect(ranking);
+        int tries = 0;
+        while (selected == other && tries < 10) {
+            selected = tournamentSelect(ranking);
+            tries++;
+        }
+        return selected;
+    }
+
+    private Solution selectPBest() {
+        List<Solution> sorted = new ArrayList<Solution>(population);
+        sorted.sort(new Comparator<Solution>() {
+            @Override
+            public int compare(Solution a, Solution b) {
+                return Double.compare(scalarScore(a), scalarScore(b));
+            }
+        });
+
+        int top = Math.max(2, (int)Math.ceil(pbestRate * sorted.size()));
+        return sorted.get(PRNG.nextInt(top));
+    }
+
+    private Solution selectFromPopulationOrArchiveDistinct(Solution a, Solution b) {
+        boolean useArchive = !cachedArchiveList.isEmpty() && PRNG.nextDouble() < 0.40;
+        Solution chosen;
+        int tries = 0;
+
+        do {
+            if (useArchive && !cachedArchiveList.isEmpty()) {
+                chosen = cachedArchiveList.get(PRNG.nextInt(cachedArchiveList.size()));
+            } else {
+                chosen = population.get(PRNG.nextInt(population.size()));
+            }
+            tries++;
+        } while ((chosen == a || chosen == b) && tries < 12);
+
+        return chosen;
+    }
+
+    // ---------------------------------------------------------------------
+    // SHADE memory updates
+    // ---------------------------------------------------------------------
+
+    private double sampleF(double mean) {
+        double f;
+        int tries = 0;
+        do {
+            f = mean + 0.10 * Math.tan(Math.PI * (PRNG.nextDouble() - 0.5));
+            tries++;
+        } while (f <= 0.0 && tries < 10);
+        return clamp(f, 0.05, 1.0);
+    }
+
+    private double sampleCR(double mean) {
+        double cr = mean + 0.10 * PRNG.nextGaussian();
+        return clamp(cr, 0.0, 1.0);
+    }
+
+    private void updateShadeMemory(List<Double> successF, List<Double> successCR, List<Double> weights) {
+        if (successF.isEmpty()) {
+            return;
+        }
+
+        double sumW = 0.0;
+        double numF = 0.0;
+        double denF = 0.0;
+        double numCR = 0.0;
+
+        for (int i = 0; i < successF.size(); i++) {
+            double w = weights.get(i).doubleValue();
+            double f = successF.get(i).doubleValue();
+            double cr = successCR.get(i).doubleValue();
+            sumW += w;
+            numF += w * f * f;
+            denF += w * f;
+            numCR += w * cr;
+        }
+
+        if (sumW <= 0.0 || denF <= 0.0) {
+            return;
+        }
+
+        memoryF[memoryIndex] = clamp(numF / denF, 0.05, 1.0);
+        memoryCR[memoryIndex] = clamp(numCR / sumW, 0.0, 1.0);
+        memoryIndex = (memoryIndex + 1) % shadeMemorySize;
+    }
+
+    // ---------------------------------------------------------------------
+    // Runtime adaptation
+    // ---------------------------------------------------------------------
+
+    private void adaptControlParameters(int accepted, int generated) {
+        double rate = generated <= 0 ? 0.0 : (double) accepted / (double) generated;
+        double progress = 1.0 - Math.exp(-0.03 * iterationCounter);
+
+        if (accepted == 0) {
+            temperature = clamp(temperature * 1.04, minTemperature, maxTemperature);
+            noiseAmplitude = clamp(noiseAmplitude * 1.05, minNoiseAmplitude, maxNoiseAmplitude);
+            localSearchSigma = clamp(localSearchSigma * 1.05, minLocalSearchSigma, maxLocalSearchSigma);
+            mutationRate = clamp(mutationRate * 1.03, 0.02, 0.25);
+            dormantBoost = clamp(dormantBoost * 1.02, 0.05, 0.80);
+        } else if (rate > 0.28) {
+            temperature = clamp(temperature * 0.98, minTemperature, maxTemperature);
+            noiseAmplitude = clamp(noiseAmplitude * 0.97, minNoiseAmplitude, maxNoiseAmplitude);
+            localSearchSigma = clamp(localSearchSigma * 0.96, minLocalSearchSigma, maxLocalSearchSigma);
+            mutationRate = clamp(mutationRate * 0.99, 0.02, 0.25);
+            dormantBoost = clamp(dormantBoost * 0.995, 0.05, 0.80);
+        }
+
+        double targetTemperature = maxTemperature - (maxTemperature - minTemperature) * progress;
+        double targetNoise = maxNoiseAmplitude - (maxNoiseAmplitude - minNoiseAmplitude) * progress;
+        double targetSigma = maxLocalSearchSigma - (maxLocalSearchSigma - minLocalSearchSigma) * progress;
+
+        temperature = clamp(0.88 * temperature + 0.12 * targetTemperature, minTemperature, maxTemperature);
+        noiseAmplitude = clamp(0.88 * noiseAmplitude + 0.12 * targetNoise, minNoiseAmplitude, maxNoiseAmplitude);
+        localSearchSigma = clamp(0.88 * localSearchSigma + 0.12 * targetSigma, minLocalSearchSigma, maxLocalSearchSigma);
+    }
+
+    // ---------------------------------------------------------------------
+    // Utility methods
+    // ---------------------------------------------------------------------
+
+    private double scalarScore(Solution s) {
+        double sum = 0.0;
+        for (int i = 0; i < s.getNumberOfObjectives(); i++) {
+            sum += objectiveValue(s, i);
+        }
+        return sum;
+    }
+
+    private boolean dominates(Solution a, Solution b) {
+        boolean strictlyBetter = false;
+        for (int i = 0; i < a.getNumberOfObjectives(); i++) {
+            double va = objectiveValue(a, i);
+            double vb = objectiveValue(b, i);
+            if (va > vb) {
+                return false;
+            }
+            if (va < vb) {
+                strictlyBetter = true;
+            }
+        }
+        return strictlyBetter;
+    }
+
+    private double objectiveValue(Solution solution, int index) {
+        return solution.getObjective(index).getValue();
+    }
+
+    private double[] objectiveMin(List<Solution> list) {
+        int m = list.get(0).getNumberOfObjectives();
+        double[] min = new double[m];
+        Arrays.fill(min, Double.POSITIVE_INFINITY);
+        for (Solution s : list) {
+            for (int i = 0; i < m; i++) {
+                min[i] = Math.min(min[i], objectiveValue(s, i));
+            }
+        }
+        return min;
+    }
+
+    private double[] objectiveMax(List<Solution> list) {
+        int m = list.get(0).getNumberOfObjectives();
+        double[] max = new double[m];
+        Arrays.fill(max, Double.NEGATIVE_INFINITY);
+        for (Solution s : list) {
+            for (int i = 0; i < m; i++) {
+                max[i] = Math.max(max[i], objectiveValue(s, i));
+            }
+        }
+        return max;
+    }
+
+    private double[] crowdingDistance(List<Solution> list) {
+        int size = list.size();
+        double[] distance = new double[size];
+
+        if (size == 0) {
+            return distance;
+        }
+        if (size <= 2) {
+            Arrays.fill(distance, Double.POSITIVE_INFINITY);
+            return distance;
+        }
+
+        int objectives = list.get(0).getNumberOfObjectives();
+        for (int obj = 0; obj < objectives; obj++) {
+            Integer[] order = new Integer[size];
+            for (int i = 0; i < size; i++) {
+                order[i] = i;
+            }
+
+            final int objectiveIndex = obj;
+            Arrays.sort(order, new Comparator<Integer>() {
+                @Override
+                public int compare(Integer a, Integer b) {
+                    return Double.compare(objectiveValue(list.get(a.intValue()), objectiveIndex),
+                            objectiveValue(list.get(b.intValue()), objectiveIndex));
+                }
+            });
+
+            double min = objectiveValue(list.get(order[0].intValue()), obj);
+            double max = objectiveValue(list.get(order[size - 1].intValue()), obj);
+            distance[order[0].intValue()] = Double.POSITIVE_INFINITY;
+            distance[order[size - 1].intValue()] = Double.POSITIVE_INFINITY;
+
+            if (Math.abs(max - min) < 1.0e-16) {
+                continue;
+            }
+
+            for (int i = 1; i < size - 1; i++) {
+                int idx = order[i].intValue();
+                if (Double.isInfinite(distance[idx])) {
+                    continue;
+                }
+                double prev = objectiveValue(list.get(order[i - 1].intValue()), obj);
+                double next = objectiveValue(list.get(order[i + 1].intValue()), obj);
+                distance[idx] += (next - prev) / (max - min);
+            }
+        }
+
+        return distance;
+    }
+
+    private GridData buildGridData(List<Solution> list) {
+        GridData data = new GridData();
+        data.keys = new String[list.size()];
+        data.occupancy = new HashMap<String, Integer>();
+
+        double[] min = objectiveMin(list);
+        double[] max = objectiveMax(list);
+
+        for (int i = 0; i < list.size(); i++) {
+            Solution s = list.get(i);
+            StringBuilder builder = new StringBuilder();
+
+            for (int j = 0; j < s.getNumberOfObjectives(); j++) {
+                double denom = Math.max(1.0e-12, max[j] - min[j]);
+                double normalized = (objectiveValue(s, j) - min[j]) / denom;
+                int bin = (int)Math.floor(normalized * gridBins);
+                if (bin < 0) {
+                    bin = 0;
+                } else if (bin >= gridBins) {
+                    bin = gridBins - 1;
+                }
+                if (j > 0) {
+                    builder.append('|');
+                }
+                builder.append(bin);
+            }
+
+            String key = builder.toString();
+            data.keys[i] = key;
+            Integer old = data.occupancy.get(key);
+            data.occupancy.put(key, old == null ? 1 : old.intValue() + 1);
+        }
+
+        return data;
+    }
+
+    private List<Solution> toList(NondominatedPopulation population) {
+        List<Solution> list = new ArrayList<Solution>(population.size());
+        for (Solution s : population) {
+            list.add(s);
+        }
+        return list;
+    }
+
+    private Solution roulette(List<Solution> list, double[] weights, double total) {
+        double draw = PRNG.nextDouble() * total;
+        double cumulative = 0.0;
+        for (int i = 0; i < list.size(); i++) {
+            cumulative += weights[i];
+            if (cumulative >= draw) {
+                return list.get(i);
+            }
+        }
+        return list.get(list.size() - 1);
+    }
+
+    private int[] extractBins(Solution solution) {
+        int[] bins = new int[solution.getNumberOfVariables()];
+        for (int var = 0; var < solution.getNumberOfVariables(); var++) {
+            if (!(solution.getVariable(var) instanceof RealVariable)) {
+                bins[var] = -1;
+                continue;
+            }
+            RealVariable rv = (RealVariable) solution.getVariable(var);
+            bins[var] = valueToBin(rv.getValue(), rv.getLowerBound(), rv.getUpperBound());
+            firingUsage[var][bins[var]] += 0.10;
+        }
+        return bins;
+    }
+
+    private int leastUsedNeuron(int variableIndex) {
+        int best = 0;
+        double bestValue = firingUsage[variableIndex][0];
+        for (int i = 1; i < neuronsPerVariable; i++) {
+            if (firingUsage[variableIndex][i] < bestValue) {
+                best = i;
+                bestValue = firingUsage[variableIndex][i];
+            }
+        }
+        return best;
+    }
+
+    private double gaussianKernel(double delta, double sigma) {
+        double scaled = delta / sigma;
+        return Math.exp(-0.5 * scaled * scaled);
+    }
+
+    private double binToValue(int bin, double lower, double upper) {
+        double fraction = (bin + 0.5) / neuronsPerVariable;
+        return lower + fraction * (upper - lower);
+    }
+
+    private int valueToBin(double value, double lower, double upper) {
+        if (upper <= lower) {
+            return 0;
+        }
+        double scaled = (value - lower) / (upper - lower);
+        int bin = (int)Math.floor(scaled * neuronsPerVariable);
+        if (bin < 0) {
+            return 0;
+        } else if (bin >= neuronsPerVariable) {
+            return neuronsPerVariable - 1;
+        }
+        return bin;
+    }
+
+    private double clamp(double value, double lower, double upper) {
+        return Math.max(lower, Math.min(upper, value));
+    }
+
+    private int getNumberOfDecisionVariables() {
+        return problem.newSolution().getNumberOfVariables();
+    }
+
+    // ---------------------------------------------------------------------
+    // Configuration
+    // ---------------------------------------------------------------------
+
+    public int getPopulationSize() {
+        return populationSize;
+    }
+
+    @Property(alias = "populationSize")
+    public void setPopulationSize(int populationSize) {
+        Validate.that("populationSize", populationSize).isGreaterThan(3);
+        this.populationSize = populationSize;
+    }
+
+    public int getOffspringSize() {
+        return offspringSize;
+    }
+
+    @Property(alias = "offspringSize")
+    public void setOffspringSize(int offspringSize) {
+        Validate.that("offspringSize", offspringSize).isGreaterThan(0);
+        this.offspringSize = offspringSize;
+    }
+
+    public int getArchiveSize() {
+        return archiveSize;
+    }
+
+    @Property(alias = "archiveSize")
+    public void setArchiveSize(int archiveSize) {
+        Validate.that("archiveSize", archiveSize).isGreaterThan(1);
+        this.archiveSize = archiveSize;
+    }
+
+    public int getNeuronsPerVariable() {
+        return neuronsPerVariable;
+    }
+
+    @Property(alias = "neuronsPerVariable")
+    public void setNeuronsPerVariable(int neuronsPerVariable) {
+        Validate.that("neuronsPerVariable", neuronsPerVariable).isGreaterThan(1);
+        this.neuronsPerVariable = neuronsPerVariable;
+    }
+
+    public int getReferenceVectorCount() {
+        return referenceVectorCount;
+    }
+
+    @Property(alias = "referenceVectorCount")
+    public void setReferenceVectorCount(int referenceVectorCount) {
+        Validate.that("referenceVectorCount", referenceVectorCount).isGreaterThan(1);
+        this.referenceVectorCount = referenceVectorCount;
+    }
+
+    @Override
+    public void applyConfiguration(TypedProperties properties) {
+        setPopulationSize(properties.getInt("populationSize", populationSize));
+        setOffspringSize(properties.getInt("offspringSize", offspringSize));
+        setArchiveSize(properties.getInt("archiveSize", archiveSize));
+        setNeuronsPerVariable(properties.getInt("neuronsPerVariable", neuronsPerVariable));
+        setReferenceVectorCount(properties.getInt("referenceVectorCount", referenceVectorCount));
+    }
+
+    @Override
+    public TypedProperties getConfiguration() {
+        TypedProperties properties = new TypedProperties();
+        properties.setInt("populationSize", populationSize);
+        properties.setInt("offspringSize", offspringSize);
+        properties.setInt("archiveSize", archiveSize);
+        properties.setInt("neuronsPerVariable", neuronsPerVariable);
+        properties.setInt("referenceVectorCount", referenceVectorCount);
+        return properties;
+    }
+
+    // ---------------------------------------------------------------------
+    // Small inner classes
+    // ---------------------------------------------------------------------
+
+    private static final class GridData {
+        String[] keys;
+        Map<String, Integer> occupancy;
+    }
+
+    private static final class ReferenceAssociation {
+        int vectorIndex;
+        double d1;
+        double d2;
+        double pbi;
+    }
+
+    private static final class RankingData {
+        IdentityHashMap<Solution, Integer> rank;
+        IdentityHashMap<Solution, Double> crowding;
+        List<List<Solution>> fronts;
+    }
+
+    private static final class OffspringRecord {
+        Solution child;
+        Solution parentA;
+        Solution parentB;
+        int[] firedBins;
+        int operator;
+        double fParameter;
+        double crParameter;
+    }
+}
